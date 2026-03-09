@@ -293,7 +293,7 @@ func (i *YingHua) StudyNode(node types.ChaptersNodeList, course types.CoursesLis
 		time.Sleep(time.Second * 30)
 		if node.VideoDuration > 0 {
 			elapsed := time.Since(sessionStart).Seconds()
-			currentPct = startPct + (elapsed/float64(node.VideoDuration)*100.0)
+			currentPct = startPct + (elapsed/float64(node.VideoDuration)*100.0) * .95
 		}
 		if currentPct > 100.0 {
 			currentPct = 100.0
