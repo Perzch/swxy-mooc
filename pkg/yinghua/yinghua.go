@@ -1,23 +1,51 @@
 package yinghua
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+
 	browser "github.com/EDDYCJY/fake-useragent"
 	"github.com/aoaostar/mooc/pkg/config"
 	"github.com/aoaostar/mooc/pkg/util"
 	"github.com/aoaostar/mooc/pkg/yinghua/types"
 	"github.com/go-resty/resty/v2"
 	"github.com/sirupsen/logrus"
-	"strconv"
-	"time"
 )
 
+// Global registry of all YingHua instances for graceful shutdown.
+var (
+	registry   []*YingHua
+	registryMu sync.Mutex
+)
+
+func init() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		logrus.Info("收到退出信号，正在结束所有活跃会话...")
+		registryMu.Lock()
+		for _, yh := range registry {
+			yh.EndActiveSession()
+		}
+		registryMu.Unlock()
+		os.Exit(0)
+	}()
+}
+
 type YingHua struct {
-	User    config.User
-	Courses []types.CoursesList
-	client  *resty.Client
+	User            config.User
+	UserID          int
+	Courses         []types.CoursesList
+	client          *resty.Client
+	activeSessionId string
+	sessionMu       sync.Mutex
 }
 
 func New(user config.User) *YingHua {
@@ -26,42 +54,48 @@ func New(user config.User) *YingHua {
 	client.SetBaseURL(user.BaseURL)
 	client.SetRetryCount(3)
 	client.SetHeader("user-agent", browser.Mobile())
-	return &YingHua{
+	yh := &YingHua{
 		User:   user,
 		client: client,
 	}
+
+	registryMu.Lock()
+	registry = append(registry, yh)
+	registryMu.Unlock()
+
+	return yh
 
 }
 
 func (i *YingHua) Login() error {
 
 	resp := new(types.LoginResponse)
-	resp2, err := i.client.R().SetFormData(map[string]string{
-		"platform":  "Android",
-		"username":  i.User.Username,
-		"password":  i.User.Password,
-		"pushId":    "140fe1da9e67b9c14a7",
-		"school_id": strconv.Itoa(i.User.SchoolID),
-		"imgSign":   "533560501d19cc30271a850810b09e3e",
-		"imgCode":   "cryd",
-	}).
-		SetResult(resp).
-		Post("/api/login.json")
-
-	if err != nil {
-		return err
+	loginRes, loginErr := i.client.R().SetQueryParams(map[string]string{
+		"number":   i.User.Username,
+		"password": i.User.Password,
+		"schoolId": strconv.Itoa(i.User.SchoolID),
+	}).SetResult(resp).Get("/api/user/login")
+	if loginErr != nil {
+		return loginErr
 	}
-	if resp.Code != 0 {
+	if resp.Code != 200 {
 		return errors.New(resp.Msg)
 	}
 
-	i.client.SetCookies(resp2.Cookies())
+	i.client.SetCookies(loginRes.Cookies())
+	i.client.SetHeader("Authorization", resp.Result)
 
-	i.client.OnBeforeRequest(func(c *resty.Client, req *resty.Request) error {
-		req.FormData.Set("token", resp.Result.Data.Token)
-		return nil
-	})
-
+	// Fetch student info to obtain the real userId
+	infoResp := new(types.StudentInfoResponse)
+	_, infoErr := i.client.R().SetResult(infoResp).Get("/api/user/yee_student_info")
+	if infoErr != nil {
+		return infoErr
+	}
+	if infoResp.Code != 200 {
+		return errors.New(infoResp.Msg)
+	}
+	i.UserID = infoResp.Data.ID
+	i.Output(fmt.Sprintf("登录成功: %s (userId=%d)", infoResp.Data.Name, i.UserID))
 	return nil
 
 }
@@ -69,184 +103,293 @@ func (i *YingHua) Login() error {
 func (i *YingHua) GetCourses() error {
 
 	resp := new(types.CoursesResponse)
-	_, err := i.client.R().
+	_, err := i.client.R().SetQueryParams(map[string]string{
+		"schoolId":  strconv.Itoa(i.User.SchoolID),
+		"studentId": strconv.Itoa(i.UserID),
+		"type":      "0",
+		"pageSize":  "1000",
+		"pageNum":   "1",
+	}).
 		SetResult(resp).
-		Post("/api/course.json")
-
+		Get("/api/user/yee_my_course_list")
 	if err != nil {
 		return err
 	}
 
-	if resp.Code != 0 {
+	if resp.Code != 200 {
 		return errors.New(resp.Msg)
 	}
-	i.Courses = resp.Result.List
+
+	// Only keep online courses (offline != 0)
+	for _, course := range resp.Result {
+		if course.Offline != 0 {
+			i.Courses = append(i.Courses, course)
+		}
+	}
 	return nil
 }
 
-func (i *YingHua) GetChapters(course types.CoursesList) ([]types.ChaptersList, error) {
+func (i *YingHua) GetChapters(course types.CoursesList) ([]types.ChapterItem, error) {
 
 	resp := new(types.ChaptersResponse)
 	_, err := i.client.R().
 		SetResult(resp).
 		SetFormData(map[string]string{
+			"schoolId": strconv.Itoa(i.User.SchoolID),
 			"courseId": strconv.Itoa(course.ID),
 		}).
-		Post("/api/course/chapter.json")
+		Post("/api/user/yee_chapter_select")
 
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.Code != 0 {
+	if resp.Code != 200 {
 		return nil, errors.New(resp.Msg)
 	}
-	return resp.Result.List, nil
+	return resp.Data, nil
+}
+
+func (i *YingHua) GetNodes(chapterId int) ([]types.ChaptersNodeList, error) {
+
+	resp := new(types.NodesResponse)
+	_, err := i.client.R().
+		SetQueryParams(map[string]string{
+			"schoolId":  strconv.Itoa(i.User.SchoolID),
+			"chapterId": strconv.Itoa(chapterId),
+		}).
+		SetResult(resp).
+		Get("/api/user/yee_node_select")
+
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Code != 200 {
+		return nil, errors.New(resp.Msg)
+	}
+	return resp.Data, nil
+}
+
+func (i *YingHua) GetStudyProgress(course types.CoursesList) (map[int]types.NodeProgress, error) {
+
+	resp := new(types.StudyProgressResponse)
+	_, err := i.client.R().
+		SetQueryParams(map[string]string{
+			"schoolId": strconv.Itoa(i.User.SchoolID),
+			"userId":   strconv.Itoa(i.UserID),
+			"courseId": strconv.Itoa(course.ID),
+		}).
+		SetResult(resp).
+		Get("/api/user/get_study_progress")
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 200 {
+		return nil, errors.New(resp.Msg)
+	}
+	m := make(map[int]types.NodeProgress, len(resp.Data.NodeProgressList))
+	for _, np := range resp.Data.NodeProgressList {
+		m[np.NodeID] = np
+	}
+	i.Output(fmt.Sprintf("课程进度: 已完成 %d/%d 节 (完成率 %.1f%%)",
+		resp.Data.Summary.CompletedNodes, resp.Data.Summary.TotalNodes, resp.Data.Summary.CompletionRate))
+	return m, nil
 }
 
 func (i *YingHua) StudyCourse(course types.CoursesList) error {
+	progressMap, err := i.GetStudyProgress(course)
+	if err != nil {
+		i.OutputWith(fmt.Sprintf("获取课程进度失败: %s，将逐节检查进度", err.Error()), logrus.Warnf)
+		progressMap = nil
+	}
+
 	chapters, err := i.GetChapters(course)
 	if err != nil {
 		return err
 	}
 	for _, chapter := range chapters {
-		i.StudyChapter(chapter)
+		i.StudyChapter(chapter, course, progressMap)
 	}
 
 	return nil
 }
 
-func (i *YingHua) StudyChapter(chapter types.ChaptersList) {
+func (i *YingHua) StudyChapter(chapter types.ChapterItem, course types.CoursesList, progressMap map[int]types.NodeProgress) {
 
-	i.Output(fmt.Sprintf("当前第 %d 章, [%s][chapterId=%d]", chapter.Idx, chapter.Name, chapter.ID))
-	for _, node := range chapter.NodeList {
-		// 试题跳过
-		if node.TabVideo {
-			i.StudyNode(node)
+	i.Output(fmt.Sprintf("当前章节: [%s][chapterId=%d]", chapter.Name, chapter.ID))
+	nodes, err := i.GetNodes(chapter.ID)
+	if err != nil {
+		i.OutputWith(fmt.Sprintf("获取节点列表失败: %s", err.Error()), logrus.Errorf)
+		return
+	}
+	for _, node := range nodes {
+		if node.TabVideo == 1 {
+			i.StudyNode(node, course, progressMap)
 		}
 	}
 
 }
 
-func (i *YingHua) StudyNode(node types.ChaptersNodeList) {
-startStudy:
-	i.Output(fmt.Sprintf("当前第 %d 课, [%s][nodeId=%d]", node.Idx, node.Name, node.ID))
-	var studyTime = 1
-	var studyId = 0
-	var nodeProgress = types.NodeVideoData{
-		StudyTotal: types.NodeVideoStudyTotal{
-			Progress: "0.00",
-		},
+func (i *YingHua) StudyNode(node types.ChaptersNodeList, course types.CoursesList, progressMap map[int]types.NodeProgress) {
+	i.Output(fmt.Sprintf("当前节点: [%s][nodeId=%d][时长=%ds]", node.Name, node.ID, node.VideoDuration))
+
+	// -- 1. Determine start percentage --
+	startPct := 0.0
+	if progressMap != nil {
+		if np, ok := progressMap[node.ID]; ok {
+			if np.ProgressPercent >= 100 {
+				i.Output(fmt.Sprintf("%s[nodeId=%d] 已完成，跳过", node.Name, node.ID))
+				return
+			}
+			startPct = np.ProgressPercent
+		} else {
+			// Node not in bulk progress map, fall back to last_progress
+			startPct = i.fetchLastProgress(node)
+			if startPct < 0 {
+				return
+			}
+		}
+	} else {
+		// No bulk map available, fall back to last_progress
+		startPct = i.fetchLastProgress(node)
+		if startPct < 0 {
+			return
+		}
 	}
-	var flag = true
-	go func() {
-		for flag {
-			var err error
-			nodeProgress, err = i.GetNodeProgress(node)
-			if err != nil {
-				i.OutputWith(fmt.Sprintf("%s[nodeId=%d], %s[studyId=%d]", node.Name, node.ID, err.Error(), studyId), logrus.Errorf)
-				flag = false
-				break
-			}
-			if nodeProgress.StudyTotal.State == "2" {
-				node.VideoState = 2
-				break
-			}
-			time.Sleep(time.Second * 10)
-		}
-	}()
 
-	for node.VideoState != 2 {
-		if !flag {
-			goto startStudy
-		}
+	// -- 2. Start study session --
+	startResp := new(types.StudySessionStartResponse)
+	_, err := i.client.R().
+		SetHeader("content-type", "application/json").
+		SetBody(map[string]interface{}{
+			"schoolId": i.User.SchoolID,
+			"userId":   i.UserID,
+			"nodeId":   strconv.Itoa(node.ID),
+			"courseId": strconv.Itoa(course.ID),
+			"terminal": "web",
+		}).
+		SetResult(startResp).
+		Post("/api/user/study_session_start")
+	if err != nil {
+		i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 开始会话失败: %s", node.Name, node.ID, err.Error()), logrus.Errorf)
+		return
+	}
+	if startResp.Code != 200 {
+		i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 开始会话失败: %s", node.Name, node.ID, startResp.Msg), logrus.Errorf)
+		return
+	}
+	sessionId := startResp.Data
+	i.sessionMu.Lock()
+	i.activeSessionId = sessionId
+	i.sessionMu.Unlock()
+	i.Output(fmt.Sprintf("%s[nodeId=%d] 会话已开始: %s, 从 %.0f%% 继续", node.Name, node.ID, sessionId, startPct))
 
-		var formData = map[string]string{
-			"nodeId":    strconv.Itoa(node.ID),
-			"studyTime": strconv.Itoa(studyTime),
-			"studyId":   strconv.Itoa(studyId),
+	// -- 3. Heartbeat loop (every 30s, progress is percentage 0~100) --
+	// Use 90% of actual elapsed to avoid triggering "progress rollback" limit.
+	sessionStart := time.Now()
+	currentPct := startPct
+	for currentPct < 100.0 {
+		time.Sleep(time.Second * 30)
+		if node.VideoDuration > 0 {
+			elapsed := time.Since(sessionStart).Seconds()
+			currentPct = startPct + (elapsed/float64(node.VideoDuration)*100.0)
 		}
-	captcha:
-		var resp = new(types.StudyNodeResponse)
-		_, err := i.client.R().
-			SetFormData(formData).
-			SetResult(resp).
-			Post("/api/node/study.json")
-		if err != nil {
-			i.OutputWith(fmt.Sprintf("%s[nodeId=%d], %s[studyId=%d][studyTime=%d]", node.Name, node.ID, err.Error(), studyId, studyTime), logrus.Errorf)
-			continue
+		if currentPct > 100.0 {
+			currentPct = 100.0
 		}
-		if resp.Code != 0 {
-			i.OutputWith(fmt.Sprintf("%s[nodeId=%d], %s[studyId=%d][studyTime=%d]", node.Name, node.ID, resp.Msg, studyId, studyTime), logrus.Errorf)
-			if resp.NeedCode {
-				formData["code"] = i.FuckCaptcha() + "_"
-				goto captcha
-			}
-			flag = false
+		progressStr := fmt.Sprintf("%.0f", currentPct)
+		hbResp := new(types.StudySessionResponse)
+		_, hbErr := i.client.R().
+			SetHeader("content-type", "application/json").
+			SetBody(map[string]string{
+				"sessionId": sessionId,
+				"progress":  progressStr,
+			}).
+			SetResult(hbResp).
+			Post("/api/user/study_session_heartbeat")
+		if hbErr != nil {
+			i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 心跳失败: %s", node.Name, node.ID, hbErr.Error()), logrus.Errorf)
 			break
 		}
-		studyId = resp.Result.Data.StudyID
-		if nodeProgress.StudyTotal.Progress == "" {
-			nodeProgress.StudyTotal.Progress = "0.00"
-
-		}
-		parseFloat, err := strconv.ParseFloat(nodeProgress.StudyTotal.Progress, 64)
-
-		if err != nil {
-			i.OutputWith(fmt.Sprintf("%s[nodeId=%d], %s[studyId=%d]", node.Name, node.ID, err.Error(), studyId), logrus.Errorf)
-			continue
-		}
-		i.Output(fmt.Sprintf("%s[nodeId=%d], %s[studyId=%d], 当前进度: %.f%%", node.Name, node.ID, resp.Msg, studyId, parseFloat*100))
-		studyTime += 10
-		time.Sleep(time.Second * 10)
+		i.Output(fmt.Sprintf("%s[nodeId=%d] %s, 当前进度: %s%%", node.Name, node.ID, hbResp.Data, progressStr))
 	}
-}
 
-func (i *YingHua) GetNodeProgress(node types.ChaptersNodeList) (types.NodeVideoData, error) {
-
-	var resp = new(types.NodeVideoResponse)
-	_, err := i.client.R().
-		SetFormData(map[string]string{
-			"nodeId": strconv.Itoa(node.ID),
+	// -- 4. End session --
+	i.sessionMu.Lock()
+	i.activeSessionId = ""
+	i.sessionMu.Unlock()
+	endResp := new(types.StudySessionResponse)
+	_, endErr := i.client.R().
+		SetHeader("content-type", "application/json").
+		SetBody(map[string]string{
+			"sessionId": sessionId,
 		}).
-		SetResult(resp).
-		Post("/api/node/video.json")
+		SetResult(endResp).
+		Post("/api/user/study_session_end")
+	if endErr != nil {
+		i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 结束会话失败: %s", node.Name, node.ID, endErr.Error()), logrus.Errorf)
+		return
+	}
+	i.Output(fmt.Sprintf("%s[nodeId=%d] %s", node.Name, node.ID, endResp.Data))
+}
+// fetchLastProgress calls /api/user/last_progress for a single node.
+// Returns the progress percentage (0.0~100.0) on success,
+// or -1 if the request fails or the node is already complete.
+func (i *YingHua) fetchLastProgress(node types.ChaptersNodeList) float64 {
+	progressResp := new(types.LastProgressResponse)
+	_, err := i.client.R().
+		SetQueryParams(map[string]string{
+			"nodeId":   strconv.Itoa(node.ID),
+			"userId":   strconv.Itoa(i.UserID),
+			"schoolId": strconv.Itoa(i.User.SchoolID),
+		}).
+		SetResult(progressResp).
+		Get("/api/user/last_progress")
 	if err != nil {
-		i.OutputWith(fmt.Sprintf("%s[nodeId=%d], %s", node.Name, node.ID, err.Error()), logrus.Errorf)
-		return resp.Result.Data, nil
+		i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 获取进度失败: %s", node.Name, node.ID, err.Error()), logrus.Errorf)
+		return -1
 	}
-	if resp.Code != 0 {
-		return resp.Result.Data, errors.New(resp.Msg)
+	if progressResp.Code != 200 {
+		i.OutputWith(fmt.Sprintf("%s[nodeId=%d] 获取进度失败: %s", node.Name, node.ID, progressResp.Msg), logrus.Errorf)
+		return -1
 	}
-	return resp.Result.Data, nil
+	pct, parseErr := strconv.ParseFloat(progressResp.Data, 64)
+	if parseErr != nil {
+		pct = 0
+	}
+	if pct >= 100.0 {
+		i.Output(fmt.Sprintf("%s[nodeId=%d] 已完成，跳过", node.Name, node.ID))
+		return -1
+	}
+	return pct
 }
 
-func (i *YingHua) FuckCaptcha() string {
+func (i *YingHua) EndActiveSession() {
+	i.sessionMu.Lock()
+	sessionId := i.activeSessionId
+	i.activeSessionId = ""
+	i.sessionMu.Unlock()
 
-	i.Output("正在识别验证码")
-	response, err := i.client.R().
-		Get(fmt.Sprintf("/service/code/aa?t=%d", time.Now().UnixNano()))
-
+	if sessionId == "" {
+		return
+	}
+	i.Output(fmt.Sprintf("正在结束会话: %s", sessionId))
+	endResp := new(types.StudySessionResponse)
+	_, err := i.client.R().
+		SetHeader("content-type", "application/json").
+		SetBody(map[string]string{
+			"sessionId": sessionId,
+		}).
+		SetResult(endResp).
+		Post("/api/user/study_session_end")
 	if err != nil {
-		i.OutputWith(err.Error(), logrus.Errorf)
+		i.OutputWith(fmt.Sprintf("结束会话失败: %s", err.Error()), logrus.Errorf)
+		return
 	}
-	var resp = new(types.Captcha)
-	client := resty.New()
-	_, err = client.R().
-		SetFileReader("file", "image.png", bytes.NewReader(response.Body())).
-		SetResult(resp).
-		Post("https://api.opop.vip/captcha/recognize")
-
-	if err != nil {
-		i.OutputWith(err.Error(), logrus.Errorf)
-	}
-	if resp.Status != "ok" {
-		i.OutputWith(resp.Message, logrus.Errorf)
-	}
-	s := resp.Data.(string)
-	i.Output(fmt.Sprintf("验证码识别成功: %s", s))
-	return s
+	i.Output(fmt.Sprintf("会话已结束: %s", endResp.Data))
 }
+
 func (i *YingHua) Output(message string) {
 	i.OutputWith(message, logrus.Infof)
 }

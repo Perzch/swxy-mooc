@@ -2,12 +2,13 @@ package task
 
 import (
 	"fmt"
+	"math"
+	"sync"
+
 	"github.com/aoaostar/mooc/pkg/config"
 	"github.com/aoaostar/mooc/pkg/yinghua"
 	"github.com/aoaostar/mooc/pkg/yinghua/types"
 	"github.com/sirupsen/logrus"
-	"math"
-	"sync"
 )
 
 type Task struct {
@@ -45,21 +46,11 @@ func Start() {
 func work(task Task) {
 	instance := yinghua.New(task.User)
 	err := instance.Login()
-	if err != nil {
-		logrus.Fatal(err)
-	}
+	//if err != nil {
+	//	logrus.Fatal(err)
+	//}
 
-	instance.Output("登录成功")
-
-	if task.Course.Progress == 1 {
-		instance.Output(fmt.Sprintf("当前课程[%s][%d] 进度: %s, 跳过", task.Course.Name, task.Course.ID, task.Course.Progress1))
-		return
-	}
-	if task.Course.State == 2 {
-		instance.Output(fmt.Sprintf("当前课程[%s][%d] 已结束, 跳过", task.Course.Name, task.Course.ID))
-		return
-	}
-	instance.Output(fmt.Sprintf("当前课程[%s][%d] 进度: %s", task.Course.Name, task.Course.ID, task.Course.Progress1))
+	//instance.Output("登录成功")
 	err = instance.StudyCourse(task.Course)
 	if err != nil {
 		instance.OutputWith(fmt.Sprintf("课程[%s][%d]: %s", task.Course.Name, task.Course.ID, err.Error()), logrus.Errorf)

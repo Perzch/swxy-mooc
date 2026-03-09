@@ -1,7 +1,4 @@
 package types
 
-type Captcha struct {
-	Status  string      `json:"status"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data"`
-}
+// This file is intentionally left empty.
+// Captcha verification has been removed from the new API.

@@ -1,10 +1,22 @@
 package types
 
 type LoginResponse struct {
-	Code   int         `json:"_code"`
-	Status bool        `json:"status"`
-	Msg    string      `json:"msg"`
-	Result LoginResult `json:"result"`
+	Code   int    `json:"code"`
+	Msg    string `json:"msg"`
+	Result string `json:"data"`
+}
+
+// StudentInfoResponse - GET /api/user/yee_student_info
+type StudentInfoResponse struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data StudentInfoData `json:"data"`
+}
+
+type StudentInfoData struct {
+	ID     int    `json:"id"`
+	Number string `json:"number"`
+	Name   string `json:"name"`
 }
 type LoginReset struct {
 	State int    `json:"state"`
